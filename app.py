@@ -218,24 +218,68 @@ def download_artifact(artifact_id):
 # REPO FILE SAVER
 # ══════════════════════════════════════════════════════════════════════════════
 def save_file(path, content, commit_msg):
-    """File ko TARGET_REPO mein push karo via GitHub API"""
+    """
+    Smart save - pehle compare karo:
+    Same content hai toh push hi mat karo! 
+    """
+    import re
     url     = f"{BASE_URL}/repos/{TARGET_REPO}/contents/{path}"
     get_res = requests.get(url, headers=gh(), timeout=10)
-    sha     = get_res.json().get("sha") if get_res.status_code == 200 else None
 
+    sha              = None
+    existing_content = None
+
+    if get_res.status_code == 200:
+        file_data = get_res.json()
+        sha       = file_data.get("sha")
+        try:
+            existing_content = base64.b64decode(file_data.get("content", "")).decode("utf-8")
+        except Exception as e:
+            log.warning(f"Existing content decode failed for {path}: {e}")
+
+    # SMART DIFF CHECK
+    if existing_content is not None:
+        def strip_dynamic(text):
+            # Timestamps strip karo - ye har baar change hote hain
+            text = re.sub(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}( UTC)?', '', text)
+            text = re.sub(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', '', text)
+            # Run IDs strip karo
+            text = re.sub(r'(Run ID\s*:?\s*)\d+', r'\1[ID]', text)
+            text = re.sub(r'(Run:\s*)\d+', r'\1[ID]', text)
+            return text.strip()
+
+        existing_stripped = strip_dynamic(existing_content)
+        new_stripped      = strip_dynamic(content)
+
+        if existing_stripped == new_stripped:
+            log.info(f"SKIP {path} - content same hai, push nahi karunga!")
+            return "skipped"
+
+        existing_lines = set(existing_stripped.splitlines())
+        new_lines      = set(new_stripped.splitlines())
+        added          = new_lines - existing_lines
+        removed        = existing_lines - new_lines
+        log.info(f"CHANGED {path} - +{len(added)} lines, -{len(removed)} lines - pushing...")
+    else:
+        log.info(f"NEW FILE {path} - creating...")
+
+    # ACTUAL PUSH
     payload = {
         "message":   commit_msg,
         "content":   base64.b64encode(content.encode("utf-8")).decode("utf-8"),
-        "committer": {"name": "Monitor Bot 🤖", "email": "monitor@noreply.github.com"}
+        "committer": {"name": "Monitor Bot", "email": "monitor@noreply.github.com"}
     }
     if sha:
         payload["sha"] = sha
 
     res = requests.put(url, headers=gh(), json=payload, timeout=15)
     ok  = res.status_code in (200, 201)
-    if not ok:
-        log.error(f"❌ Save failed {path}: {res.status_code} | {res.text[:200]}")
-    return ok
+    if ok:
+        log.info(f"Pushed: {path}")
+    else:
+        log.error(f"Push failed {path}: {res.status_code} | {res.text[:200]}")
+    return "pushed" if ok else "failed"
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
