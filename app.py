@@ -1,57 +1,115 @@
-from flask import Flask, jsonify, Response
-import requests
+import logging
+import sys
 import os
 import zipfile
 import io
+import requests
+from flask import Flask, jsonify
+
+# ─── Logging setup - Render pe sab dikhega ───────────────────────────────────
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-GITHUB_PAT = os.environ.get("GITHUB_PAT")
-TARGET_REPO = os.environ.get("TARGET_REPO", "error404unknownuser99-ux/Claude")
+# ─── Config ──────────────────────────────────────────────────────────────────
+GITHUB_PAT   = os.environ.get("GITHUB_PAT", "")
+TARGET_REPO  = os.environ.get("TARGET_REPO", "error404unknownuser99-ux/Claude")
+BASE_URL     = "https://api.github.com"
 
-HEADERS = {
-    "Authorization": f"token {GITHUB_PAT}",
-    "Accept": "application/vnd.github+json"
-}
+log.info("=== Monitor API Starting ===")
+log.info(f"TARGET_REPO  : {TARGET_REPO}")
+log.info(f"GITHUB_PAT   : {'SET ✅ (' + GITHUB_PAT[:6] + '...)' if GITHUB_PAT else 'MISSING ❌'}")
 
-BASE_URL = "https://api.github.com"
 
+def headers():
+    return {
+        "Authorization": f"token {GITHUB_PAT}",
+        "Accept": "application/vnd.github+json"
+    }
+
+
+# ─── GitHub API helpers ───────────────────────────────────────────────────────
 
 def get_latest_run():
-    """Latest workflow run fetch karo"""
-    url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/runs?per_page=1"
-    res = requests.get(url, headers=HEADERS)
-    runs = res.json().get("workflow_runs", [])
-    return runs[0] if runs else None
+    """Sabse naya triggered run - running ho ya completed"""
+    url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/runs?per_page=1&direction=desc"
+    log.debug(f"GET {url}")
+    try:
+        res = requests.get(url, headers=headers(), timeout=15)
+        log.debug(f"Response status: {res.status_code}")
+        log.debug(f"Response body: {res.text[:500]}")
 
+        if res.status_code == 401:
+            log.error("❌ 401 Unauthorized - PAT invalid ya expire ho gaya!")
+            return None, "PAT invalid ya expire ho gaya (401)"
 
-def get_job_logs(job_id):
-    """Job ka raw log fetch karo"""
-    url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/jobs/{job_id}/logs"
-    res = requests.get(url, headers=HEADERS, allow_redirects=True)
-    if res.status_code == 200:
-        return res.text
-    return f"Logs fetch nahi hue. Status: {res.status_code}"
+        if res.status_code == 404:
+            log.error(f"❌ 404 - Repo nahi mila: {TARGET_REPO}")
+            return None, f"Repo nahi mila: {TARGET_REPO} (404)"
+
+        if res.status_code != 200:
+            log.error(f"❌ Unexpected status: {res.status_code}")
+            return None, f"GitHub API error: {res.status_code}"
+
+        data = res.json()
+        total = data.get("total_count", 0)
+        runs  = data.get("workflow_runs", [])
+        log.info(f"Total runs found: {total}, Fetched: {len(runs)}")
+
+        if not runs:
+            log.warning("⚠️ Koi bhi run nahi mila repo mein")
+            return None, "Repo mein abhi tak koi workflow run nahi hua"
+
+        run = runs[0]
+        log.info(f"Latest run → ID:{run['id']} | Name:{run['name']} | Status:{run['status']} | Conclusion:{run['conclusion']}")
+        return run, None
+
+    except requests.exceptions.Timeout:
+        log.error("❌ GitHub API timeout!")
+        return None, "GitHub API timeout"
+    except Exception as e:
+        log.error(f"❌ Exception: {e}")
+        return None, str(e)
 
 
 def get_jobs(run_id):
-    """Run ke sare jobs fetch karo"""
     url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/runs/{run_id}/jobs"
-    res = requests.get(url, headers=HEADERS)
+    log.debug(f"GET jobs: {url}")
+    res = requests.get(url, headers=headers(), timeout=15)
+    log.debug(f"Jobs response: {res.status_code}")
     return res.json().get("jobs", [])
 
 
+def get_job_logs(job_id):
+    url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/jobs/{job_id}/logs"
+    log.debug(f"GET logs: {url}")
+    res = requests.get(url, headers=headers(), allow_redirects=True, timeout=20)
+    log.debug(f"Log response: {res.status_code}, size: {len(res.text)} chars")
+    if res.status_code == 200:
+        return res.text
+    log.warning(f"⚠️ Log fetch failed: {res.status_code} - {res.text[:200]}")
+    return f"[Log fetch failed - HTTP {res.status_code}]"
+
+
 def get_artifacts(run_id):
-    """Run ke sare artifacts fetch karo"""
     url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/runs/{run_id}/artifacts"
-    res = requests.get(url, headers=HEADERS)
-    return res.json().get("artifacts", [])
+    log.debug(f"GET artifacts: {url}")
+    res = requests.get(url, headers=headers(), timeout=15)
+    arts = res.json().get("artifacts", [])
+    log.info(f"Artifacts found: {len(arts)}")
+    return arts
 
 
 def download_artifact(artifact_id):
-    """Artifact zip download karke extract karo"""
     url = f"{BASE_URL}/repos/{TARGET_REPO}/actions/artifacts/{artifact_id}/zip"
-    res = requests.get(url, headers=HEADERS, allow_redirects=True)
+    log.debug(f"Downloading artifact: {artifact_id}")
+    res = requests.get(url, headers=headers(), allow_redirects=True, timeout=30)
     if res.status_code == 200:
         extracted = {}
         with zipfile.ZipFile(io.BytesIO(res.content)) as z:
@@ -60,100 +118,102 @@ def download_artifact(artifact_id):
                     try:
                         extracted[name] = f.read().decode("utf-8")
                     except:
-                        extracted[name] = "[binary file - decode nahi hua]"
+                        extracted[name] = "[binary file]"
+        log.info(f"Artifact {artifact_id} extracted: {list(extracted.keys())}")
         return extracted
+    log.warning(f"Artifact download failed: {res.status_code}")
     return {}
 
 
-# ─────────────────────────────────────────
-# ROUTES
-# ─────────────────────────────────────────
+# ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def home():
+    log.info("GET /")
     return jsonify({
         "status": "🟢 Monitor API running!",
         "repo": TARGET_REPO,
+        "pat_loaded": bool(GITHUB_PAT),
         "endpoints": {
-            "/latest": "Latest workflow run info",
-            "/logs": "Latest run ke logs",
-            "/artifacts": "Latest run ke artifacts list",
-            "/artifacts/download": "Latest run ke artifacts ka content",
-            "/full": "Sab kuch ek saath - logs + artifacts"
+            "/latest":             "Latest run info (running ya completed - jo bhi naya ho)",
+            "/logs":               "Latest run ke poore logs + errors",
+            "/artifacts":          "Artifacts ki list",
+            "/artifacts/download": "Artifacts ka extracted content",
+            "/full":               "Sab kuch ek saath"
         }
     })
 
 
 @app.route("/latest")
-def latest_run():
-    run = get_latest_run()
-    if not run:
-        return jsonify({"error": "Koi run nahi mila"}), 404
-
+def latest_run_route():
+    log.info("GET /latest")
+    run, err = get_latest_run()
+    if err:
+        log.error(f"/latest error: {err}")
+        return jsonify({"error": err}), 404
     return jsonify({
-        "run_id": run["id"],
-        "workflow": run["name"],
-        "status": run["status"],
+        "run_id":     run["id"],
+        "workflow":   run["name"],
+        "status":     run["status"],
         "conclusion": run["conclusion"],
         "created_at": run["created_at"],
         "updated_at": run["updated_at"],
-        "url": run["html_url"]
+        "url":        run["html_url"]
     })
 
 
 @app.route("/logs")
-def logs():
-    run = get_latest_run()
-    if not run:
-        return jsonify({"error": "Koi run nahi mila"}), 404
+def logs_route():
+    log.info("GET /logs")
+    run, err = get_latest_run()
+    if err:
+        return jsonify({"error": err}), 404
 
     jobs = get_jobs(run["id"])
-    if not jobs:
-        return jsonify({"error": "Koi job nahi mila"}), 404
-
     all_logs = {}
-    errors = []
+    errors   = []
 
     for job in jobs:
         log_text = get_job_logs(job["id"])
         all_logs[job["name"]] = {
-            "status": job["status"],
-            "conclusion": job["conclusion"],
-            "log": log_text,
+            "status":       job["status"],
+            "conclusion":   job["conclusion"],
+            "log":          log_text,
             "last_20_lines": "\n".join(log_text.splitlines()[-20:])
         }
         if job["conclusion"] == "failure":
             errors.append({
-                "job": job["name"],
+                "job":      job["name"],
                 "log_tail": "\n".join(log_text.splitlines()[-30:])
             })
 
     return jsonify({
-        "run_id": run["id"],
-        "workflow": run["name"],
-        "status": run["status"],
+        "run_id":     run["id"],
+        "workflow":   run["name"],
+        "status":     run["status"],
         "conclusion": run["conclusion"],
-        "jobs": all_logs,
-        "errors": errors
+        "jobs":       all_logs,
+        "errors":     errors
     })
 
 
 @app.route("/artifacts")
-def artifacts():
-    run = get_latest_run()
-    if not run:
-        return jsonify({"error": "Koi run nahi mila"}), 404
+def artifacts_route():
+    log.info("GET /artifacts")
+    run, err = get_latest_run()
+    if err:
+        return jsonify({"error": err}), 404
 
     arts = get_artifacts(run["id"])
     return jsonify({
-        "run_id": run["id"],
-        "workflow": run["name"],
+        "run_id":         run["id"],
+        "workflow":       run["name"],
         "artifact_count": len(arts),
         "artifacts": [
             {
-                "id": a["id"],
-                "name": a["name"],
-                "size_mb": round(a["size_in_bytes"] / 1024 / 1024, 2),
+                "id":         a["id"],
+                "name":       a["name"],
+                "size_mb":    round(a["size_in_bytes"] / 1024 / 1024, 2),
                 "created_at": a["created_at"],
                 "expires_at": a["expires_at"]
             }
@@ -163,66 +223,61 @@ def artifacts():
 
 
 @app.route("/artifacts/download")
-def artifacts_download():
-    run = get_latest_run()
-    if not run:
-        return jsonify({"error": "Koi run nahi mila"}), 404
+def artifacts_download_route():
+    log.info("GET /artifacts/download")
+    run, err = get_latest_run()
+    if err:
+        return jsonify({"error": err}), 404
 
     arts = get_artifacts(run["id"])
     if not arts:
-        return jsonify({"error": "Koi artifact nahi mila is run mein"}), 404
+        return jsonify({"error": "Is run mein koi artifact nahi mila"}), 404
 
     result = {}
     for a in arts:
-        extracted = download_artifact(a["id"])
-        result[a["name"]] = extracted
+        result[a["name"]] = download_artifact(a["id"])
 
-    return jsonify({
-        "run_id": run["id"],
-        "workflow": run["name"],
-        "artifacts": result
-    })
+    return jsonify({"run_id": run["id"], "workflow": run["name"], "artifacts": result})
 
 
 @app.route("/full")
-def full():
-    """Sab kuch ek saath"""
-    run = get_latest_run()
-    if not run:
-        return jsonify({"error": "Koi run nahi mila"}), 404
+def full_route():
+    log.info("GET /full")
+    run, err = get_latest_run()
+    if err:
+        return jsonify({"error": err}), 404
 
-    # Logs
-    jobs = get_jobs(run["id"])
-    all_logs = {}
-    errors = []
+    jobs      = get_jobs(run["id"])
+    all_logs  = {}
+    errors    = []
+
     for job in jobs:
         log_text = get_job_logs(job["id"])
         all_logs[job["name"]] = {
-            "status": job["status"],
-            "conclusion": job["conclusion"],
-            "log": log_text,
+            "status":        job["status"],
+            "conclusion":    job["conclusion"],
+            "log":           log_text,
             "last_20_lines": "\n".join(log_text.splitlines()[-20:])
         }
         if job["conclusion"] == "failure":
             errors.append({"job": job["name"], "tail": log_text.splitlines()[-30:]})
 
-    # Artifacts
-    arts = get_artifacts(run["id"])
+    arts             = get_artifacts(run["id"])
     artifact_contents = {}
     for a in arts:
         artifact_contents[a["name"]] = download_artifact(a["id"])
 
     return jsonify({
         "run": {
-            "id": run["id"],
-            "workflow": run["name"],
-            "status": run["status"],
+            "id":         run["id"],
+            "workflow":   run["name"],
+            "status":     run["status"],
             "conclusion": run["conclusion"],
             "created_at": run["created_at"],
-            "url": run["html_url"]
+            "url":        run["html_url"]
         },
-        "logs": all_logs,
-        "errors": errors,
+        "logs":      all_logs,
+        "errors":    errors,
         "artifacts": artifact_contents
     })
 
