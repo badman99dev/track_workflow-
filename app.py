@@ -65,24 +65,63 @@ def validate_workflow_files():
         try:
             parsed = yaml.safe_load(content)
             issues = []
+
             if not isinstance(parsed, dict):
                 issues.append("Root element dict nahi hai")
             else:
-                if "on" not in parsed and True not in parsed:
-                    issues.append("'on' trigger missing")
+                # ── 1. Basic structure ──
+                trigger_key = "on" if "on" in parsed else (True if True in parsed else None)
+                if trigger_key is None:
+                    issues.append("'on' trigger missing hai")
                 if "jobs" not in parsed:
-                    issues.append("'jobs' section missing")
-                else:
-                    for jname, jdata in parsed.get("jobs", {}).items():
-                        if not isinstance(jdata, dict):
-                            issues.append(f"Job '{jname}' invalid")
-                        else:
-                            if "steps"    not in jdata: issues.append(f"Job '{jname}': 'steps' missing")
-                            if "runs-on"  not in jdata: issues.append(f"Job '{jname}': 'runs-on' missing")
+                    issues.append("'jobs' section missing hai")
+
+                # ── 2. GitHub Actions semantic rules ──
+                triggers = parsed.get("on") or parsed.get(True) or {}
+                if isinstance(triggers, dict):
+                    for event_name, event_cfg in triggers.items():
+                        if not isinstance(event_cfg, dict):
+                            continue
+                        # RULE: paths aur paths-ignore ek saath nahi ho sakte
+                        if "paths" in event_cfg and "paths-ignore" in event_cfg:
+                            issues.append(
+                                f"❌ GitHub Rule violation in '{event_name}': "
+                                f"'paths' aur 'paths-ignore' dono ek saath nahi ho sakte! "
+                                f"Ek hi choose karo."
+                            )
+                        # RULE: branches aur branches-ignore ek saath nahi
+                        if "branches" in event_cfg and "branches-ignore" in event_cfg:
+                            issues.append(
+                                f"❌ GitHub Rule violation in '{event_name}': "
+                                f"'branches' aur 'branches-ignore' dono ek saath nahi ho sakte!"
+                            )
+                        # RULE: tags aur tags-ignore ek saath nahi
+                        if "tags" in event_cfg and "tags-ignore" in event_cfg:
+                            issues.append(
+                                f"❌ GitHub Rule violation in '{event_name}': "
+                                f"'tags' aur 'tags-ignore' dono ek saath nahi ho sakte!"
+                            )
+
+                # ── 3. Jobs check ──
+                for jname, jdata in parsed.get("jobs", {}).items():
+                    if not isinstance(jdata, dict):
+                        issues.append(f"Job '{jname}' invalid hai")
+                    else:
+                        if "steps"   not in jdata: issues.append(f"Job '{jname}': 'steps' missing")
+                        if "runs-on" not in jdata: issues.append(f"Job '{jname}': 'runs-on' missing")
+                        # RULE: environment variables ke names check
+                        for step in jdata.get("steps", []):
+                            if not isinstance(step, dict): continue
+                            if "run" not in step and "uses" not in step:
+                                issues.append(f"Job '{jname}': ek step mein 'run' ya 'uses' missing")
+
             if issues:
-                results[name] = {"valid": False, "syntax_ok": True,  "issues": issues}
+                results[name] = {"valid": False, "syntax_ok": True, "issues": issues}
+                log.warning(f"⚠️ {name}: {issues}")
             else:
-                results[name] = {"valid": True,  "syntax_ok": True,  "status": "✅ Sahi hai!"}
+                results[name] = {"valid": True, "syntax_ok": True, "status": "✅ Sahi hai!"}
+                log.info(f"✅ {name}: valid!")
+
         except yaml.YAMLError as e:
             results[name] = {"valid": False, "syntax_ok": False, "error": f"YAML Syntax Error: {str(e)}"}
             log.error(f"❌ YAML error in {name}: {e}")
